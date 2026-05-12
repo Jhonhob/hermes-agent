@@ -981,13 +981,13 @@ def _pool_may_recover_from_rate_limit(
     at least one entry not currently in exhaustion cooldown.  But rotation is
     only meaningful when the pool has more than one entry.
 
-    With a single-credential pool (common for Gemini OAuth, Vertex service
+    With a single-credential pool (common for OAuth, service
     accounts, and any "one personal key" configuration), the primary entry
     just 429'd and there is nothing to rotate to.  Waiting for the pool
     cooldown to expire means retrying against the same exhausted quota — the
     daily-quota 429 will recur immediately, and the retry budget is burned.
 
-    Additionally, Google CloudCode / Gemini CLI rate limits are ACCOUNT-level
+    Additionally, some providers implement ACCOUNT-level
     throttles — even a multi-entry pool shares the same quota window, so
     rotation won't recover.  Skip straight to the fallback for those (#13636).
 
@@ -1218,12 +1218,10 @@ class AIAgent:
             pass
 
         # GPT-5.x models usually require the Responses API path, but some
-        # providers have exceptions (for example Copilot's gpt-5-mini still
-        # uses chat completions). Also auto-upgrade for direct OpenAI URLs
+        # providers have exceptions. Also auto-upgrade for direct OpenAI URLs
         # (api.openai.com) since all newer tool-calling models prefer
-        # Responses there. ACP runtimes are excluded: CopilotACPClient
-        # handles its own routing and does not implement the Responses API
-        # surface.
+        # Responses there. Custom ACP runtimes are excluded as they handle
+        # their own routing and do not implement the Responses API surface.
         # When api_mode was explicitly provided, respect it — the user
         # knows what their endpoint supports (#10473).
         # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
@@ -3031,16 +3029,6 @@ class AIAgent:
             url = getattr(self, "_base_url_lower", "") or ""
         return "openai.azure.com" in url
 
-    def _is_github_copilot_url(self, base_url: str = None) -> bool:
-        """Return True when a base URL targets GitHub Copilot's OpenAI-compatible API."""
-        if base_url is not None:
-            hostname = base_url_hostname(base_url)
-        else:
-            hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
-                getattr(self, "_base_url_lower", "")
-            )
-        return hostname == "api.githubcopilot.com"
-
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
 
@@ -3248,7 +3236,7 @@ class AIAgent:
                 from hermes_cli.models import _should_use_copilot_responses_api
                 return _should_use_copilot_responses_api(model)
             except Exception:
-                # Fall back to the generic GPT-5 rule if Copilot-specific
+                # Fall back to the generic GPT-5 rule if provider-specific
                 # logic is unavailable for any reason.
                 pass
         return AIAgent._model_requires_responses_api(model)
@@ -3262,7 +3250,7 @@ class AIAgent:
         OpenAI-compatible endpoint. OpenRouter, local models, and older
         OpenAI models use 'max_tokens'.
         """
-        if self._is_direct_openai_url() or self._is_azure_openai_url() or self._is_github_copilot_url():
+        if self._is_direct_openai_url() or self._is_azure_openai_url():
             return {"max_completion_tokens": value}
         return {"max_tokens": value}
 
@@ -6079,54 +6067,6 @@ class AIAgent:
         client_kwargs = dict(client_kwargs)
         _validate_proxy_env_urls()
         _validate_base_url(client_kwargs.get("base_url"))
-        if self.provider == "copilot-acp" or str(client_kwargs.get("base_url", "")).startswith("acp://copilot"):
-            from agent.copilot_acp_client import CopilotACPClient
-
-            client = CopilotACPClient(**client_kwargs)
-            logger.info(
-                "Copilot ACP client created (%s, shared=%s) %s",
-                reason,
-                shared,
-                self._client_log_context(),
-            )
-            return client
-        if self.provider == "google-gemini-cli" or str(client_kwargs.get("base_url", "")).startswith("cloudcode-pa://"):
-            from agent.gemini_cloudcode_adapter import GeminiCloudCodeClient
-
-            # Strip OpenAI-specific kwargs the Gemini client doesn't accept
-            safe_kwargs = {
-                k: v for k, v in client_kwargs.items()
-                if k in {"api_key", "base_url", "default_headers", "project_id", "timeout"}
-            }
-            client = GeminiCloudCodeClient(**safe_kwargs)
-            logger.info(
-                "Gemini Cloud Code Assist client created (%s, shared=%s) %s",
-                reason,
-                shared,
-                self._client_log_context(),
-            )
-            return client
-        if self.provider == "gemini":
-            from agent.gemini_native_adapter import GeminiNativeClient, is_native_gemini_base_url
-
-            base_url = str(client_kwargs.get("base_url", "") or "")
-            if is_native_gemini_base_url(base_url):
-                safe_kwargs = {
-                    k: v for k, v in client_kwargs.items()
-                    if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
-                }
-                if "http_client" not in safe_kwargs:
-                    keepalive_http = self._build_keepalive_http_client(base_url)
-                    if keepalive_http is not None:
-                        safe_kwargs["http_client"] = keepalive_http
-                client = GeminiNativeClient(**safe_kwargs)
-                logger.info(
-                    "Gemini native client created (%s, shared=%s) %s",
-                    reason,
-                    shared,
-                    self._client_log_context(),
-                )
-                return client
         # Inject TCP keepalives so the kernel detects dead provider connections
         # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
         # this, a peer that drops mid-stream leaves the socket in a state where
@@ -6671,41 +6611,6 @@ class AIAgent:
         if not self._replace_primary_openai_client(reason="nous_credential_refresh"):
             return False
 
-        return True
-
-    def _try_refresh_copilot_client_credentials(self) -> bool:
-        """Refresh Copilot credentials and rebuild the shared OpenAI client.
-
-        Copilot tokens may remain the same string across refreshes (`gh auth token`
-        returns a stable OAuth token in many setups). We still rebuild the client
-        on 401 so retries recover from stale auth/client state without requiring
-        a session restart.
-        """
-        if self.provider != "copilot":
-            return False
-
-        try:
-            from hermes_cli.copilot_auth import resolve_copilot_token
-
-            new_token, token_source = resolve_copilot_token()
-        except Exception as exc:
-            logger.debug("Copilot credential refresh failed: %s", exc)
-            return False
-
-        if not isinstance(new_token, str) or not new_token.strip():
-            return False
-
-        new_token = new_token.strip()
-
-        self.api_key = new_token
-        self._client_kwargs["api_key"] = self.api_key
-        self._client_kwargs["base_url"] = self.base_url
-        self._apply_client_headers_for_base_url(str(self.base_url or ""))
-
-        if not self._replace_primary_openai_client(reason="copilot_credential_refresh"):
-            return False
-
-        logger.info("Copilot credentials refreshed from %s", token_source)
         return True
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
@@ -8074,9 +7979,7 @@ class AIAgent:
                 fb_model,
                 provider=fb_provider,
             ):
-                # GPT-5.x models usually need Responses API, but keep
-                # provider-specific exceptions like Copilot gpt-5-mini on
-                # chat completions.
+                # GPT-5.x models usually need Responses API.
                 fb_api_mode = "codex_responses"
             # Unified OpenAI-compatible api_mode for all fallbacks
             fb_api_mode = "chat_completions"
@@ -11765,7 +11668,6 @@ class AIAgent:
             codex_auth_retry_attempted=False
             anthropic_auth_retry_attempted=False
             nous_auth_retry_attempted=False
-            copilot_auth_retry_attempted=False
             thinking_sig_retry_attempted = False
             image_shrink_retry_attempted = False
             oauth_1m_beta_retry_attempted = False
@@ -11883,13 +11785,11 @@ class AIAgent:
                     # session instead of re-failing every retry.
                     if getattr(self, "_disable_streaming", False):
                         _use_streaming = False
-                    # CopilotACPClient communicates via subprocess stdio and
-                    # returns a plain SimpleNamespace — not an iterable
-                    # stream.  Mirror the ACP exclusion used for Responses
-                    # API upgrade (lines ~1083-1085).
+                    # Custom ACP runtimes communicate via subprocess stdio and
+                    # return a plain SimpleNamespace — not an iterable
+                    # stream. Disable streaming for these endpoints.
                     elif (
-                        self.provider == "copilot-acp"
-                        or str(self.base_url or "").lower().startswith("acp://copilot")
+                        str(self.base_url or "").lower().startswith("acp://")
                         or str(self.base_url or "").lower().startswith("acp+tcp://")
                     ):
                         _use_streaming = False
@@ -12888,15 +12788,6 @@ class AIAgent:
                         print(f"{self.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
                         print(f"{self.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
                         print(f"{self.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
-                    if (
-                        self.provider == "copilot"
-                        and status_code == 401
-                        and not copilot_auth_retry_attempted
-                    ):
-                        copilot_auth_retry_attempted = True
-                        if self._try_refresh_copilot_client_credentials():
-                            self._vprint(f"{self.log_prefix}🔐 Copilot credentials refreshed after 401. Retrying request...")
-                            continue
                     if (
                         self.api_mode == "anthropic_messages"
                         and status_code == 401
