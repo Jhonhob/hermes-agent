@@ -1201,38 +1201,8 @@ class AIAgent:
         self.provider = provider_name or ""
         self.acp_command = acp_command or command
         self.acp_args = list(acp_args or args or [])
-        if api_mode in {"chat_completions", "codex_responses", "anthropic_messages", "bedrock_converse"}:
-            self.api_mode = api_mode
-        elif self.provider == "openai-codex":
-            self.api_mode = "codex_responses"
-        elif self.provider == "xai":
-            self.api_mode = "codex_responses"
-        elif (provider_name is None) and (
-            self._base_url_hostname == "chatgpt.com"
-            and "/backend-api/codex" in self._base_url_lower
-        ):
-            self.api_mode = "codex_responses"
-            self.provider = "openai-codex"
-        elif (provider_name is None) and self._base_url_hostname == "api.x.ai":
-            self.api_mode = "codex_responses"
-            self.provider = "xai"
-        elif self.provider == "anthropic" or (provider_name is None and self._base_url_hostname == "api.anthropic.com"):
-            self.api_mode = "anthropic_messages"
-            self.provider = "anthropic"
-        elif self._base_url_lower.rstrip("/").endswith("/anthropic"):
-            # Third-party Anthropic-compatible endpoints (e.g. MiniMax, DashScope)
-            # use a URL convention ending in /anthropic. Auto-detect these so the
-            # Anthropic Messages API adapter is used instead of chat completions.
-            self.api_mode = "anthropic_messages"
-        elif self.provider == "bedrock" or (
-            self._base_url_hostname.startswith("bedrock-runtime.")
-            and base_url_host_matches(self._base_url_lower, "amazonaws.com")
-        ):
-            # AWS Bedrock — auto-detect from provider name or base URL
-            # (bedrock-runtime.<region>.amazonaws.com).
-            self.api_mode = "bedrock_converse"
-        else:
-            self.api_mode = "chat_completions"
+        # All providers now use OpenAI-compatible chat completions API
+        self.api_mode = "chat_completions"
 
         # Eagerly warm the transport cache so import errors surface at init,
         # not mid-conversation.  Also validates the api_mode is registered.
@@ -1264,26 +1234,28 @@ class AIAgent:
         # Exception: Azure OpenAI serves gpt-5.x on /chat/completions and
         # does NOT support the Responses API — skip the upgrade for Azure
         # (openai.azure.com), even though it looks OpenAI-compatible.
-        if (
-            api_mode is None
-            and self.api_mode == "chat_completions"
-            and self.provider != "copilot-acp"
-            and not str(self.base_url or "").lower().startswith("acp://copilot")
-            and not str(self.base_url or "").lower().startswith("acp+tcp://")
-            and not self._is_azure_openai_url()
-            and (
-                self._is_direct_openai_url()
-                or self._provider_model_requires_responses_api(
-                    self.model,
-                    provider=self.provider,
-                )
-            )
-        ):
-            self.api_mode = "codex_responses"
-            # Invalidate the eager-warmed transport cache — api_mode changed
-            # from chat_completions to codex_responses after the warm at __init__.
-            if hasattr(self, "_transport_cache"):
-                self._transport_cache.clear()
+        # REFACTOR: Removed codex_responses support - only chat_completions now
+        # if (
+        #     api_mode is None
+        #     and self.api_mode == "chat_completions"
+        #     and self.provider != "copilot-acp"
+        #     and not str(self.base_url or "").lower().startswith("acp://copilot")
+        #     and not str(self.base_url or "").lower().startswith("acp+tcp://")
+        #     and not self._is_azure_openai_url()
+        #     and (
+        #         self._is_direct_openai_url()
+        #         or self._provider_model_requires_responses_api(
+        #             self.model,
+        #             provider=self.provider,
+        #         )
+        #     )
+        # ):
+        #     self.api_mode = "codex_responses"
+        #     # Invalidate the eager-warmed transport cache — api_mode changed
+        #     # from chat_completions to codex_responses after the warm at __init__.
+        #     if hasattr(self, "_transport_cache"):
+        #         self._transport_cache.clear()
+        pass  # Always use chat_completions
 
         # Pre-warm OpenRouter model metadata cache in a background thread.
         # fetch_model_metadata() is cached for 1 hour; this avoids a blocking
@@ -2559,24 +2531,8 @@ class AIAgent:
         change persists across turns (unlike fallback which is
         turn-scoped).
         """
-        from hermes_cli.providers import determine_api_mode
-
-        # ── Determine api_mode if not provided ──
-        if not api_mode:
-            api_mode = determine_api_mode(new_provider, base_url)
-
-        # Defense-in-depth: ensure OpenCode base_url doesn't carry a trailing
-        # /v1 into the anthropic_messages client, which would cause the SDK to
-        # hit /v1/v1/messages.  `model_switch.switch_model()` already strips
-        # this, but we guard here so any direct callers (future code paths,
-        # tests) can't reintroduce the double-/v1 404 bug.
-        if (
-            api_mode == "anthropic_messages"
-            and new_provider in {"opencode-zen", "opencode-go"}
-            and isinstance(base_url, str)
-            and base_url
-        ):
-            base_url = re.sub(r"/v1/?$", "", base_url)
+        # All providers now use OpenAI-compatible chat completions API
+        api_mode = "chat_completions"
 
         old_model = self.model
         old_provider = self.provider
@@ -2599,42 +2555,21 @@ class AIAgent:
             self.api_key = api_key
 
         # ── Build new client ──
-        if api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import (
-                build_anthropic_client,
-                resolve_anthropic_token,
-                _is_oauth_token,
-            )
-            # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
-            # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
-            # API key — falling back would send Anthropic credentials to third-party endpoints.
-            _is_native_anthropic = new_provider == "anthropic"
-            effective_key = (api_key or self.api_key or resolve_anthropic_token() or "") if _is_native_anthropic else (api_key or self.api_key or "")
-            self.api_key = effective_key
-            self._anthropic_api_key = effective_key
-            self._anthropic_base_url = base_url or getattr(self, "_anthropic_base_url", None)
-            self._anthropic_client = build_anthropic_client(
-                effective_key, self._anthropic_base_url,
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-            self._is_anthropic_oauth = _is_oauth_token(effective_key) if _is_native_anthropic else False
-            self.client = None
-            self._client_kwargs = {}
-        else:
-            effective_key = api_key or self.api_key
-            effective_base = base_url or self.base_url
-            self._client_kwargs = {
-                "api_key": effective_key,
-                "base_url": effective_base,
-            }
-            _sm_timeout = get_provider_request_timeout(self.provider, self.model)
-            if _sm_timeout is not None:
-                self._client_kwargs["timeout"] = _sm_timeout
-            self.client = self._create_openai_client(
-                dict(self._client_kwargs),
-                reason="switch_model",
-                shared=True,
-            )
+        # All providers now use OpenAI-compatible client
+        effective_key = api_key or self.api_key
+        effective_base = base_url or self.base_url
+        self._client_kwargs = {
+            "api_key": effective_key,
+            "base_url": effective_base,
+        }
+        _sm_timeout = get_provider_request_timeout(self.provider, self.model)
+        if _sm_timeout is not None:
+            self._client_kwargs["timeout"] = _sm_timeout
+        self.client = self._create_openai_client(
+            dict(self._client_kwargs),
+            reason="switch_model",
+            shared=True,
+        )
 
         # ── Re-evaluate prompt caching ──
         self._use_prompt_caching, self._use_native_cache_layout = (
@@ -3417,98 +3352,40 @@ class AIAgent:
         api_mode: Optional[str] = None,
         model: Optional[str] = None,
     ) -> tuple[bool, bool]:
-        """Decide whether to apply Anthropic prompt caching and which layout to use.
+        """Decide whether to apply prompt caching and which layout to use.
 
         Returns ``(should_cache, use_native_layout)``:
           * ``should_cache`` — inject ``cache_control`` breakpoints for this
-            request (applies to OpenRouter Claude, native Anthropic, and
-            third-party gateways that speak the native Anthropic protocol).
+            request (applies to providers that support OpenAI-style cache_control).
           * ``use_native_layout`` — place markers on the *inner* content
-            blocks (native Anthropic accepts and requires this layout);
-            when False markers go on the message envelope (OpenRouter and
-            OpenAI-wire proxies expect the looser layout).
+            blocks; when False markers go on the message envelope.
 
-        Third-party providers using the native Anthropic transport
-        (``api_mode == 'anthropic_messages'`` + Claude-named model) get
-        caching with the native layout so they benefit from the same
-        cost reduction as direct Anthropic callers, provided their
-        gateway implements the Anthropic cache_control contract
-        (MiniMax, Zhipu GLM, LiteLLM's Anthropic proxy mode all do).
-
-        Qwen / Alibaba-family models on OpenCode, OpenCode Go, and direct
-        Alibaba (DashScope) also honour Anthropic-style ``cache_control``
-        markers on OpenAI-wire chat completions. Upstream pi-mono #3392 /
-        pi #3393 documented this for opencode-go Qwen. Without markers
-        these providers serve zero cache hits, re-billing the full prompt
-        on every turn.
+        All providers now use OpenAI-compatible chat completions API.
+        Caching is determined by provider/model heuristics only.
         """
         eff_provider = (provider if provider is not None else self.provider) or ""
         eff_base_url = base_url if base_url is not None else (self.base_url or "")
-        eff_api_mode = api_mode if api_mode is not None else (self.api_mode or "")
         eff_model = (model if model is not None else self.model) or ""
 
         model_lower = eff_model.lower()
         provider_lower = eff_provider.lower()
         is_claude = "claude" in model_lower
         is_openrouter = base_url_host_matches(eff_base_url, "openrouter.ai")
-        # Nous Portal proxies to OpenRouter behind the scenes — identical
-        # OpenAI-wire envelope cache_control semantics. Treat it as an
-        # OpenRouter-equivalent endpoint for caching layout purposes.
         is_nous_portal = "nousresearch" in eff_base_url.lower()
-        is_anthropic_wire = eff_api_mode == "anthropic_messages"
-        is_native_anthropic = (
-            is_anthropic_wire
-            and (eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com")
-        )
 
-        if is_native_anthropic:
-            return True, True
+        # OpenRouter/Nous Portal Claude models get caching with envelope layout
         if (is_openrouter or is_nous_portal) and is_claude:
             return True, False
-        # Nous Portal Qwen (e.g. qwen3.6-plus) takes the same envelope-layout
-        # cache_control path as Portal Claude. Portal proxies to OpenRouter
-        # and the upstream Qwen route accepts cache_control markers; without
-        # this branch the alibaba-family check below only matches
-        # provider=opencode/alibaba and Portal traffic falls through to
-        # (False, False), serving 0% cache hits and re-billing the full
-        # prompt on every turn.
+        # Nous Portal Qwen also gets caching
         if is_nous_portal and "qwen" in model_lower:
             return True, False
-        if is_anthropic_wire and is_claude:
-            # Third-party Anthropic-compatible gateway.
-            return True, True
 
-        # MiniMax on its Anthropic-compatible endpoint serves its own
-        # model family (MiniMax-M2.7, M2.5, M2.1, M2) with documented
-        # cache_control support (0.1× read pricing, 5-minute TTL).  The
-        # blanket is_claude gate above excludes these — opt them in
-        # explicitly via provider id or host match so users on
-        # provider=minimax / minimax-cn (or custom endpoints pointing at
-        # api.minimax.io/anthropic / api.minimaxi.com/anthropic) get the
-        # same cost reduction as Claude traffic.
-        # Docs: https://platform.minimax.io/docs/api-reference/anthropic-api-compatible-cache
-        if is_anthropic_wire:
-            is_minimax_provider = provider_lower in {"minimax", "minimax-cn"}
-            is_minimax_host = (
-                base_url_host_matches(eff_base_url, "api.minimax.io")
-                or base_url_host_matches(eff_base_url, "api.minimaxi.com")
-            )
-            if is_minimax_provider or is_minimax_host:
-                return True, True
-
-        # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope: OpenAI-wire
-        # transport that accepts Anthropic-style cache_control markers and
-        # rewards them with real cache hits.  Without this branch
-        # qwen3.6-plus on opencode-go reports 0% cached tokens and burns
-        # through the subscription on every turn.
+        # Qwen/Alibaba on OpenCode (Zen/Go) and native DashScope
         model_is_qwen = "qwen" in model_lower
         provider_is_alibaba_family = provider_lower in {
             "opencode", "opencode-zen", "opencode-go", "alibaba",
         }
         if provider_is_alibaba_family and model_is_qwen:
-            # Envelope layout (native_anthropic=False): markers on inner
-            # content parts, not top-level tool messages.  Matches
-            # pi-mono's "alibaba" cacheControlFormat.
             return True, False
 
         return False, False

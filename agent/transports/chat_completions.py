@@ -608,7 +608,10 @@ class ChatCompletionsTransport(ProviderTransport):
         return None
 
 
-# Auto-register on import
-from agent.transports import register_transport  # noqa: E402
+# Auto-register on import — use delayed import to avoid circular dependency
+def _register():
+    from agent.transports import register_transport
+    register_transport("chat_completions", ChatCompletionsTransport)
 
-register_transport("chat_completions", ChatCompletionsTransport)
+_register()
+del _register
