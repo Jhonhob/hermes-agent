@@ -3093,7 +3093,6 @@ class AIAgent:
         *,
         provider: Optional[str] = None,
         base_url: Optional[str] = None,
-        api_mode: Optional[str] = None,
         model: Optional[str] = None,
     ) -> tuple[bool, bool]:
         """Decide whether to apply prompt caching and which layout to use.
@@ -3139,35 +3138,23 @@ class AIAgent:
         *,
         provider: Optional[str] = None,
         base_url: Optional[str] = None,
-        api_mode: Optional[str] = None,
         model: Optional[str] = None,
     ) -> bool:
         """Decide whether the long-lived (1h cross-session) cache layout applies.
 
         Narrower than ``_anthropic_prompt_cache_policy`` — only enabled
-        for Claude models on the four endpoints whose cross-session
-        cache_control behavior we have explicitly validated:
+        for Claude and Qwen models on validated endpoints:
 
-          * Native Anthropic API (``api_mode == 'anthropic_messages'`` +
-            host ``api.anthropic.com``)
-          * Anthropic OAuth subscription (same transport as native API)
           * OpenRouter (``base_url`` contains ``openrouter.ai``)
           * Nous Portal (``base_url`` contains ``nousresearch`` — proxies
             to OpenRouter, so identical wire-format)
 
-        All four honour ``cache_control`` on both the tools array and the
+        Both honour ``cache_control`` on both the tools array and the
         first system content block, and bill cross-session cache reads at
         the documented 0.1× rate.
-
-        Other endpoints covered by the standard ``system_and_3`` policy
-        (third-party Anthropic gateways, MiniMax, opencode-go Qwen, etc.)
-        keep that layout — they support cache_control but their behavior
-        with mixed-TTL multi-block system content has not been validated
-        against this codebase.
         """
         eff_provider = (provider if provider is not None else self.provider) or ""
         eff_base_url = base_url if base_url is not None else (self.base_url or "")
-        eff_api_mode = api_mode if api_mode is not None else (self.api_mode or "")
         eff_model = (model if model is not None else self.model) or ""
 
         model_lower = eff_model.lower()
@@ -3185,18 +3172,8 @@ class AIAgent:
         if not is_claude:
             return False
 
-        # Native Anthropic + Anthropic OAuth subscription
-        if eff_api_mode == "anthropic_messages":
-            if eff_provider == "anthropic" or base_url_hostname(eff_base_url) == "api.anthropic.com":
-                return True
-
         # OpenRouter
         if base_url_host_matches(eff_base_url, "openrouter.ai"):
-            return True
-
-        # Nous Portal — front-ends OpenRouter behind the scenes; identical
-        # wire format and cache_control semantics.
-        if is_nous_portal:
             return True
 
         return False
@@ -6612,6 +6589,7 @@ class AIAgent:
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
         # Anthropic credential refresh not available - adapter removed as part of OpenAI-compatible refactor
+        # This function is deprecated and always returns False
         return False
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
@@ -7468,11 +7446,7 @@ class AIAgent:
                     if self._interrupt_requested:
                         raise InterruptedError("Agent interrupted before stream retry")
                     try:
-                        if self.api_mode == "anthropic_messages":
-                            self._try_refresh_anthropic_client_credentials()
-                            result["response"] = _call_anthropic()
-                        else:
-                            result["response"] = _call_chat_completions()
+                        result["response"] = _call_chat_completions()
                         return  # success
                     except Exception as e:
                         _is_timeout = isinstance(
@@ -7785,13 +7759,9 @@ class AIAgent:
 
             if self._interrupt_requested:
                 try:
-                    if self.api_mode == "anthropic_messages":
-                        self._anthropic_client.close()
-                        self._rebuild_anthropic_client()
-                    else:
-                        request_client = request_client_holder.get("client")
-                        if request_client is not None:
-                            self._close_request_openai_client(request_client, reason="stream_interrupt_abort")
+                    request_client = request_client_holder.get("client")
+                    if request_client is not None:
+                        self._close_request_openai_client(request_client, reason="stream_interrupt_abort")
                 except Exception:
                     pass
                 raise InterruptedError("Agent interrupted during streaming API call")
@@ -8680,72 +8650,6 @@ class AIAgent:
             )
         else:
             tools_for_api = self.tools
-
-        if self.api_mode == "anthropic_messages":
-            _transport = self._get_transport()
-            anthropic_messages = self._prepare_anthropic_messages_for_api(api_messages)
-            ctx_len = getattr(self, "context_compressor", None)
-            ctx_len = ctx_len.context_length if ctx_len else None
-            ephemeral_out = getattr(self, "_ephemeral_max_output_tokens", None)
-            if ephemeral_out is not None:
-                self._ephemeral_max_output_tokens = None  # consume immediately
-            return _transport.build_kwargs(
-                model=self.model,
-                messages=anthropic_messages,
-                tools=tools_for_api,
-                max_tokens=ephemeral_out if ephemeral_out is not None else self.max_tokens,
-                reasoning_config=self.reasoning_config,
-                is_oauth=self._is_anthropic_oauth,
-                preserve_dots=self._anthropic_preserve_dots(),
-                context_length=ctx_len,
-                base_url=getattr(self, "_anthropic_base_url", None),
-                fast_mode=(self.request_overrides or {}).get("speed") == "fast",
-                drop_context_1m_beta=bool(getattr(self, "_oauth_1m_beta_disabled", False)),
-            )
-
-        # AWS Bedrock native Converse API — bypasses the OpenAI client entirely.
-        # The adapter handles message/tool conversion and boto3 calls directly.
-        if self.api_mode == "bedrock_converse":
-            _bt = self._get_transport()
-            region = getattr(self, "_bedrock_region", None) or "us-east-1"
-            guardrail = getattr(self, "_bedrock_guardrail_config", None)
-            return _bt.build_kwargs(
-                model=self.model,
-                messages=api_messages,
-                tools=tools_for_api,
-                max_tokens=self.max_tokens or 4096,
-                region=region,
-                guardrail_config=guardrail,
-            )
-
-        if self.api_mode == "codex_responses":
-            _ct = self._get_transport()
-            is_github_responses = (
-                base_url_host_matches(self.base_url, "models.github.ai")
-                or base_url_host_matches(self.base_url, "api.githubcopilot.com")
-            )
-            is_codex_backend = (
-                self.provider == "openai-codex"
-                or (
-                    self._base_url_hostname == "chatgpt.com"
-                    and "/backend-api/codex" in self._base_url_lower
-                )
-            )
-            is_xai_responses = self.provider == "xai" or self._base_url_hostname == "api.x.ai"
-            _msgs_for_codex = self._prepare_messages_for_non_vision_model(api_messages)
-            return _ct.build_kwargs(
-                model=self.model,
-                messages=_msgs_for_codex,
-                tools=tools_for_api,
-                reasoning_config=self.reasoning_config,
-                session_id=getattr(self, "session_id", None),
-                max_tokens=self.max_tokens,
-                request_overrides=self.request_overrides,
-                is_github_responses=is_github_responses,
-                is_codex_backend=is_codex_backend,
-                is_xai_responses=is_xai_responses,
-                github_reasoning_extra=self._github_models_reasoning_extra_body() if is_github_responses else None,
-            )
 
         # ── chat_completions (default) ─────────────────────────────────────
         _ct = self._get_transport()
@@ -10752,28 +10656,20 @@ class AIAgent:
             if _is_nous:
                 summary_extra_body["tags"] = ["product=hermes-agent"]
 
-            if self.api_mode == "codex_responses":
-                codex_kwargs = self._build_api_kwargs(api_messages)
-                codex_kwargs.pop("tools", None)
-                summary_response = self._run_codex_stream(codex_kwargs)
-                _ct_sum = self._get_transport()
-                _cnr_sum = _ct_sum.normalize_response(summary_response)
-                final_response = (_cnr_sum.content or "").strip()
-            else:
-                summary_kwargs = {
-                    "model": self.model,
-                    "messages": api_messages,
-                }
-                if _summary_temperature is not None:
-                    summary_kwargs["temperature"] = _summary_temperature
-                if self.max_tokens is not None:
-                    summary_kwargs.update(self._max_tokens_param(self.max_tokens))
-                if _lm_reasoning_effort is not None:
-                    summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+            summary_kwargs = {
+                "model": self.model,
+                "messages": api_messages,
+            }
+            if _summary_temperature is not None:
+                summary_kwargs["temperature"] = _summary_temperature
+            if self.max_tokens is not None:
+                summary_kwargs.update(self._max_tokens_param(self.max_tokens))
+            if _lm_reasoning_effort is not None:
+                summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
 
-                # Include provider routing preferences
-                provider_preferences = {}
-                if self.providers_allowed:
+            # Include provider routing preferences
+            provider_preferences = {}
+            if self.providers_allowed:
                     provider_preferences["only"] = self.providers_allowed
                 if self.providers_ignored:
                     provider_preferences["ignore"] = self.providers_ignored
@@ -10811,19 +10707,9 @@ class AIAgent:
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
-                if self.api_mode == "anthropic_messages":
-                    _tsum = self._get_transport()
-                    _ant_kw = _tsum.build_kwargs(model=self.model, messages=api_messages, tools=None,
-                                   max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
-                                   is_oauth=self._is_anthropic_oauth,
-                                   preserve_dots=self._anthropic_preserve_dots())
-                    summary_response = self._anthropic_messages_create(_ant_kw)
-                    _summary_result = _tsum.normalize_response(summary_response, strip_tool_prefix=self._is_anthropic_oauth)
-                    final_response = (_summary_result.content or "").strip()
-                else:
-                    summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
-                    _summary_result = self._get_transport().normalize_response(summary_response)
-                    final_response = (_summary_result.content or "").strip()
+                summary_response = self._ensure_primary_openai_client(reason="iteration_limit_summary").chat.completions.create(**summary_kwargs)
+                _summary_result = self._get_transport().normalize_response(summary_response)
+                final_response = (_summary_result.content or "").strip()
 
             if final_response:
                 if "<think>" in final_response:
@@ -10834,24 +10720,7 @@ class AIAgent:
                     final_response = "I reached the iteration limit and couldn't generate a summary."
             else:
                 # Retry summary generation
-                if self.api_mode == "codex_responses":
-                    codex_kwargs = self._build_api_kwargs(api_messages)
-                    codex_kwargs.pop("tools", None)
-                    retry_response = self._run_codex_stream(codex_kwargs)
-                    _ct_retry = self._get_transport()
-                    _cnr_retry = _ct_retry.normalize_response(retry_response)
-                    final_response = (_cnr_retry.content or "").strip()
-                elif self.api_mode == "anthropic_messages":
-                    _tretry = self._get_transport()
-                    _ant_kw2 = _tretry.build_kwargs(model=self.model, messages=api_messages, tools=None,
-                                    is_oauth=self._is_anthropic_oauth,
-                                    max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
-                                    preserve_dots=self._anthropic_preserve_dots())
-                    retry_response = self._anthropic_messages_create(_ant_kw2)
-                    _retry_result = _tretry.normalize_response(retry_response, strip_tool_prefix=self._is_anthropic_oauth)
-                    final_response = (_retry_result.content or "").strip()
-                else:
-                    summary_kwargs = {
+                summary_kwargs = {
                         "model": self.model,
                         "messages": api_messages,
                     }
@@ -11730,8 +11599,6 @@ class AIAgent:
                     api_kwargs = self._build_api_kwargs(api_messages)
                     if self._force_ascii_payload:
                         _sanitize_structure_non_ascii(api_kwargs)
-                    if self.api_mode == "codex_responses":
-                        api_kwargs = self._get_transport().preflight_kwargs(api_kwargs, allow_stream=False)
 
                     try:
                         from hermes_cli.plugins import invoke_hook as _invoke_hook
@@ -11826,79 +11693,14 @@ class AIAgent:
                     # Validate response shape before proceeding
                     response_invalid = False
                     error_details = []
-                    if self.api_mode == "codex_responses":
-                        _ct_v = self._get_transport()
-                        if not _ct_v.validate_response(response):
-                            if response is None:
-                                response_invalid = True
-                                error_details.append("response is None")
-                            else:
-                                # Provider returned a terminal failure (e.g. quota exhaustion).
-                                # Treat as invalid so the fallback chain is triggered instead of
-                                # letting the error bubble up outside the retry/fallback loop.
-                                _codex_resp_status = str(getattr(response, "status", "") or "").strip().lower()
-                                if _codex_resp_status in {"failed", "cancelled"}:
-                                    _codex_error_obj = getattr(response, "error", None)
-                                    _codex_error_msg = (
-                                        _codex_error_obj.get("message") if isinstance(_codex_error_obj, dict)
-                                        else str(_codex_error_obj) if _codex_error_obj
-                                        else f"Responses API returned status '{_codex_resp_status}'"
-                                    )
-                                    logging.warning(
-                                        "Codex response status='%s' (error=%s). Routing to fallback. %s",
-                                        _codex_resp_status, _codex_error_msg,
-                                        self._client_log_context(),
-                                    )
-                                    response_invalid = True
-                                    error_details.append(f"response.status={_codex_resp_status}: {_codex_error_msg}")
-                                else:
-                                    # output_text fallback: stream backfill may have failed
-                                    # but normalize can still recover from output_text
-                                    _out_text = getattr(response, "output_text", None)
-                                    _out_text_stripped = _out_text.strip() if isinstance(_out_text, str) else ""
-                                    if _out_text_stripped:
-                                        logger.debug(
-                                            "Codex response.output is empty but output_text is present "
-                                            "(%d chars); deferring to normalization.",
-                                            len(_out_text_stripped),
-                                        )
-                                    else:
-                                        _resp_status = getattr(response, "status", None)
-                                        _resp_incomplete = getattr(response, "incomplete_details", None)
-                                        logger.warning(
-                                            "Codex response.output is empty after stream backfill "
-                                            "(status=%s, incomplete_details=%s, model=%s). %s",
-                                            _resp_status, _resp_incomplete,
-                                            getattr(response, "model", None),
-                                            f"api_mode={self.api_mode} provider={self.provider}",
-                                        )
-                                        response_invalid = True
-                                        error_details.append("response.output is empty")
-                    elif self.api_mode == "anthropic_messages":
-                        _tv = self._get_transport()
-                        if not _tv.validate_response(response):
-                            response_invalid = True
-                            if response is None:
-                                error_details.append("response is None")
-                            else:
-                                error_details.append("response.content invalid (not a non-empty list)")
-                    elif self.api_mode == "bedrock_converse":
-                        _btv = self._get_transport()
-                        if not _btv.validate_response(response):
-                            response_invalid = True
-                            if response is None:
-                                error_details.append("response is None")
-                            else:
-                                error_details.append("Bedrock response invalid (no output or choices)")
-                    else:
-                        _ctv = self._get_transport()
-                        if not _ctv.validate_response(response):
-                            response_invalid = True
-                            if response is None:
-                                error_details.append("response is None")
-                            elif not hasattr(response, 'choices'):
-                                error_details.append("response has no 'choices' attribute")
-                            elif response.choices is None:
+                    _ctv = self._get_transport()
+                    if not _ctv.validate_response(response):
+                        response_invalid = True
+                        if response is None:
+                            error_details.append("response is None")
+                        elif not hasattr(response, 'choices'):
+                            error_details.append("response has no 'choices' attribute")
+                        elif response.choices is None:
                                 error_details.append("response.choices is None")
                             else:
                                 error_details.append("response.choices is empty")
@@ -12038,60 +11840,30 @@ class AIAgent:
                         continue  # Retry the API call
 
                     # Check finish_reason before proceeding
-                    if self.api_mode == "codex_responses":
-                        status = getattr(response, "status", None)
-                        incomplete_details = getattr(response, "incomplete_details", None)
-                        incomplete_reason = None
-                        if isinstance(incomplete_details, dict):
-                            incomplete_reason = incomplete_details.get("reason")
-                        else:
-                            incomplete_reason = getattr(incomplete_details, "reason", None)
-                        if status == "incomplete" and incomplete_reason in {"max_output_tokens", "length"}:
-                            finish_reason = "length"
-                        else:
-                            finish_reason = "stop"
-                    elif self.api_mode == "anthropic_messages":
-                        _tfr = self._get_transport()
-                        finish_reason = _tfr.map_finish_reason(response.stop_reason)
-                    elif self.api_mode == "bedrock_converse":
-                        # Bedrock response already normalized at dispatch — use transport
-                        _bt_fr = self._get_transport()
-                        _bedrock_result = _bt_fr.normalize_response(response)
-                        finish_reason = _bedrock_result.finish_reason
-                    else:
-                        _cc_fr = self._get_transport()
-                        _finish_result = _cc_fr.normalize_response(response)
-                        finish_reason = _finish_result.finish_reason
-                        assistant_message = _finish_result
-                        if self._should_treat_stop_as_truncated(
-                            finish_reason,
-                            assistant_message,
-                            messages,
-                        ):
-                            self._vprint(
-                                f"{self.log_prefix}⚠️  Treating suspicious Ollama/GLM stop response as truncated",
-                                force=True,
-                            )
-                            finish_reason = "length"
+                    _cc_fr = self._get_transport()
+                    _finish_result = _cc_fr.normalize_response(response)
+                    finish_reason = _finish_result.finish_reason
+                    assistant_message = _finish_result
+                    if self._should_treat_stop_as_truncated(
+                        finish_reason,
+                        assistant_message,
+                        messages,
+                    ):
+                        self._vprint(
+                            f"{self.log_prefix}⚠️  Treating suspicious Ollama/GLM stop response as truncated",
+                            force=True,
+                        )
+                        finish_reason = "length"
 
                     if finish_reason == "length":
                         self._vprint(f"{self.log_prefix}⚠️  Response truncated (finish_reason='length') - model hit max output tokens", force=True)
 
                         # Normalize the truncated response to a single OpenAI-style
                         # message shape so text-continuation and tool-call retry
-                        # work uniformly across chat_completions, bedrock_converse,
-                        # and anthropic_messages.  For Anthropic we use the same
-                        # adapter the agent loop already relies on so the rebuilt
-                        # interim assistant message is byte-identical to what
-                        # would have been appended in the non-truncated path.
+                        # work uniformly across chat_completions.
                         _trunc_msg = None
                         _trunc_transport = self._get_transport()
-                        if self.api_mode == "anthropic_messages":
-                            _trunc_result = _trunc_transport.normalize_response(
-                                response, strip_tool_prefix=self._is_anthropic_oauth
-                            )
-                        else:
-                            _trunc_result = _trunc_transport.normalize_response(response)
+                        _trunc_result = _trunc_transport.normalize_response(response)
                         _trunc_msg = _trunc_result
 
                         _trunc_content = getattr(_trunc_msg, "content", None) if _trunc_msg else None
@@ -12723,37 +12495,7 @@ class AIAgent:
                     # original report (we chose reactive recovery over the
                     # proposed unconditional omit so capable subscriptions
                     # don't silently lose the capability).
-                    if (
-                        classified.reason == FailoverReason.oauth_long_context_beta_forbidden
-                        and self.api_mode == "anthropic_messages"
-                        and self._is_anthropic_oauth
-                        and not oauth_1m_beta_retry_attempted
-                    ):
-                        oauth_1m_beta_retry_attempted = True
-                        if not getattr(self, "_oauth_1m_beta_disabled", False):
-                            self._oauth_1m_beta_disabled = True
-                            try:
-                                self._anthropic_client.close()
-                            except Exception:
-                                pass
-                            self._rebuild_anthropic_client()
-                            self._vprint(
-                                f"{self.log_prefix}🔕 OAuth subscription doesn't support "
-                                f"the 1M-context beta — disabled for this session and retrying...",
-                                force=True,
-                            )
-                            continue
 
-                    if (
-                        self.api_mode == "codex_responses"
-                        and self.provider == "openai-codex"
-                        and status_code == 401
-                        and not codex_auth_retry_attempted
-                    ):
-                        codex_auth_retry_attempted = True
-                        if self._try_refresh_codex_client_credentials(force=True):
-                            self._vprint(f"{self.log_prefix}🔐 Codex auth refreshed after 401. Retrying request...")
-                            continue
                     if (
                         self.api_mode == "chat_completions"
                         and self.provider == "nous"
@@ -12785,22 +12527,6 @@ class AIAgent:
                         print(f"{self.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
                         print(f"{self.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
                         print(f"{self.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
-                    if (
-                        self.api_mode == "anthropic_messages"
-                        and status_code == 401
-                        and hasattr(self, '_anthropic_api_key')
-                        and not anthropic_auth_retry_attempted
-                    ):
-                        anthropic_auth_retry_attempted = True
-                        # Anthropic credential refresh not available - adapter removed
-                        print(f"{self.log_prefix}🔧 Anthropic 401 — authentication failed.")
-                        print(f"{self.log_prefix}   Note: Anthropic adapter removed in OpenAI-compatible refactor")
-                        print(f"{self.log_prefix}   Troubleshooting:")
-                        from hermes_constants import display_hermes_home as _dhh_fn
-                        _dhh = _dhh_fn()
-                        print(f"{self.log_prefix}     • Check ANTHROPIC_TOKEN in {_dhh}/.env for Hermes-managed OAuth/setup tokens")
-                        print(f"{self.log_prefix}     • Check ANTHROPIC_API_KEY in {_dhh}/.env for API keys or legacy token values")
-                        print(f"{self.log_prefix}     • For API keys: verify at https://platform.claude.com/settings/keys")
                         print(f"{self.log_prefix}     • For Claude Code: run 'claude /login' to refresh, then retry")
                         print(f"{self.log_prefix}     • Legacy cleanup: hermes config set ANTHROPIC_TOKEN \"\"")
                         print(f"{self.log_prefix}     • Clear stale keys: hermes config set ANTHROPIC_API_KEY \"\"")
@@ -13580,10 +13306,7 @@ class AIAgent:
 
             try:
                 _transport = self._get_transport()
-                _normalize_kwargs = {}
-                if self.api_mode == "anthropic_messages":
-                    _normalize_kwargs["strip_tool_prefix"] = self._is_anthropic_oauth
-                normalized = _transport.normalize_response(response, **_normalize_kwargs)
+                normalized = _transport.normalize_response(response)
                 assistant_message = normalized
                 finish_reason = normalized.finish_reason
                 
