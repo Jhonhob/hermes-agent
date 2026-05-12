@@ -6709,49 +6709,8 @@ class AIAgent:
         return True
 
     def _try_refresh_anthropic_client_credentials(self) -> bool:
-        if self.api_mode != "anthropic_messages" or not hasattr(self, "_anthropic_api_key"):
-            return False
-        # Only refresh credentials for the native Anthropic provider.
-        # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
-        if self.provider != "anthropic":
-            return False
-        # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
-        # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
-        _base = getattr(self, "_anthropic_base_url", "") or ""
-        if "azure.com" in _base:
-            return False
-
-        try:
-            # Anthropic credential refresh requires anthropic_adapter which has been removed
-            logger.debug("Anthropic credential refresh not available - adapter removed")
-            return False
-        except Exception as exc:
-            logger.debug("Anthropic credential refresh failed: %s", exc)
-            return False
-
-        if not isinstance(new_token, str) or not new_token.strip():
-            return False
-        new_token = new_token.strip()
-        if new_token == self._anthropic_api_key:
-            return False
-
-        try:
-            self._anthropic_client.close()
-        except Exception:
-            pass
-
-        # build_anthropic_client has been removed with anthropic_adapter
-        logger.warning("Anthropic client rebuild not available - adapter removed")
+        # Anthropic credential refresh not available - adapter removed as part of OpenAI-compatible refactor
         return False
-
-        self._anthropic_api_key = new_token
-        # Update OAuth flag — token type may have changed (API key ↔ OAuth).
-        # Only treat as OAuth on native Anthropic; third-party endpoints using
-        # the Anthropic protocol must not trip OAuth paths (#1739 & third-party
-        # identity-injection guard).
-        # _is_oauth_token has been removed with anthropic_adapter
-        self._is_anthropic_oauth = False if self.provider == "anthropic" else False
-        return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
         from agent.auxiliary_client import _AI_GATEWAY_HEADERS, build_or_headers
@@ -6903,18 +6862,11 @@ class AIAgent:
         return pool.has_available()
 
     def _anthropic_messages_create(self, api_kwargs: dict):
-        if self.api_mode == "anthropic_messages":
-            self._try_refresh_anthropic_client_credentials()
-        return self._anthropic_client.messages.create(**api_kwargs)
+        # anthropic_messages mode removed - use unified OpenAI-compatible path
+        raise RuntimeError("anthropic_messages mode not available - adapter removed")
 
     def _rebuild_anthropic_client(self) -> None:
-        """Rebuild the Anthropic client after an interrupt or stale call.
-
-        This method has been deprecated as anthropic_adapter has been removed.
-        The system now uses OpenAI compatible interfaces only.
-        """
-        # anthropic_adapter has been removed - this method is now a no-op
-        logger.debug("_rebuild_anthropic_client called but adapter removed - no-op")
+        # _rebuild_anthropic_client removed - adapter no longer available
         pass
 
     def _interruptible_api_call(self, api_kwargs: dict):
@@ -6936,38 +6888,12 @@ class AIAgent:
 
         def _call():
             try:
-                if self.api_mode == "codex_responses":
-                    request_client_holder["client"] = self._create_request_openai_client(
-                        reason="codex_stream_request",
-                        api_kwargs=api_kwargs,
-                    )
-                    result["response"] = self._run_codex_stream(
-                        api_kwargs,
-                        client=request_client_holder["client"],
-                        on_first_delta=getattr(self, "_codex_on_first_delta", None),
-                    )
-                elif self.api_mode == "anthropic_messages":
-                    # anthropic_messages mode requires anthropic_adapter which has been removed
-                    # Fall through to chat_completions as the unified OpenAI-compatible path
-                    request_client_holder["client"] = self._create_request_openai_client(
-                        reason="chat_completion_request",
-                        api_kwargs=api_kwargs,
-                    )
-                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
-                elif self.api_mode == "bedrock_converse":
-                    # bedrock_converse mode requires bedrock_adapter which has been removed
-                    # Fall through to chat_completions as the unified OpenAI-compatible path
-                    request_client_holder["client"] = self._create_request_openai_client(
-                        reason="chat_completion_request",
-                        api_kwargs=api_kwargs,
-                    )
-                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
-                else:
-                    request_client_holder["client"] = self._create_request_openai_client(
-                        reason="chat_completion_request",
-                        api_kwargs=api_kwargs,
-                    )
-                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+                # Unified OpenAI-compatible chat completions path - all other modes removed
+                request_client_holder["client"] = self._create_request_openai_client(
+                    reason="chat_completion_request",
+                    api_kwargs=api_kwargs,
+                )
+                result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
             except Exception as e:
                 result["error"] = e
             finally:
@@ -7241,19 +7167,7 @@ class AIAgent:
         if self._interrupt_requested:
             raise InterruptedError("Agent interrupted before streaming API call")
 
-        if self.api_mode == "codex_responses":
-            # Codex streams internally via _run_codex_stream. The main dispatch
-            # in _interruptible_api_call already calls it; we just need to
-            # ensure on_first_delta reaches it. Store it on the instance
-            # temporarily so _run_codex_stream can pick it up.
-            self._codex_on_first_delta = on_first_delta
-            try:
-                return self._interruptible_api_call(api_kwargs)
-            finally:
-                self._codex_on_first_delta = None
-
-        # Bedrock Converse mode removed - fall through to unified chat_completions streaming path
-        # The bedrock_adapter has been removed as part of the OpenAI-compatible interface refactor
+        # Unified OpenAI-compatible chat completions streaming path - all other modes removed
 
         result = {"response": None, "error": None, "partial_tool_names": []}
         request_client_holder = {"client": None, "diag": None}
@@ -8164,11 +8078,8 @@ class AIAgent:
                 # provider-specific exceptions like Copilot gpt-5-mini on
                 # chat completions.
                 fb_api_mode = "codex_responses"
-            elif fb_provider == "bedrock" or (
-                base_url_hostname(fb_base_url).startswith("bedrock-runtime.")
-                and base_url_host_matches(fb_base_url, "amazonaws.com")
-            ):
-                fb_api_mode = "bedrock_converse"
+            # Unified OpenAI-compatible api_mode for all fallbacks
+            fb_api_mode = "chat_completions"
 
             old_model = self.model
             self.model = fb_model
@@ -8184,73 +8095,36 @@ class AIAgent:
             # SDK default.
             _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
-            if fb_api_mode == "anthropic_messages":
-                # anthropic_messages mode removed - use unified OpenAI-compatible path
-                # The anthropic_adapter has been removed as part of the refactor
-                self.api_key = fb_client.api_key
-                self.client = fb_client
-                self._client_kwargs = {
-                    "api_key": fb_client.api_key,
-                    "base_url": fb_base_url,
-                }
-                if _fb_timeout is not None:
-                    self._client_kwargs["timeout"] = _fb_timeout
-            elif fb_api_mode == "bedrock_converse":
-                # bedrock_converse mode removed - use unified OpenAI-compatible path
-                # The bedrock_adapter has been removed as part of the refactor
-                self.api_key = fb_client.api_key
-                self.client = fb_client
-                self._client_kwargs = {
-                    "api_key": fb_client.api_key,
-                    "base_url": fb_base_url,
-                }
-                if _fb_timeout is not None:
-                    self._client_kwargs["timeout"] = _fb_timeout
-            else:
-                # Swap OpenAI client and config in-place
-                self.api_key = fb_client.api_key
-                self.client = fb_client
-                # Preserve provider-specific headers that
-                # resolve_provider_client() may have baked into
-                # fb_client via the default_headers kwarg.  The OpenAI
-                # SDK stores these in _custom_headers.  Without this,
-                # subsequent request-client rebuilds (via
-                # _create_request_openai_client) drop the headers,
-                # causing 403s from providers like Kimi Coding that
-                # require a User-Agent sentinel.
-                fb_headers = getattr(fb_client, "_custom_headers", None)
-                if not fb_headers:
-                    fb_headers = getattr(fb_client, "default_headers", None)
-                self._client_kwargs = {
-                    "api_key": fb_client.api_key,
-                    "base_url": fb_base_url,
-                    **({"default_headers": dict(fb_headers)} if fb_headers else {}),
-                }
-                if _fb_timeout is not None:
-                    self._client_kwargs["timeout"] = _fb_timeout
-                    # Rebuild the shared OpenAI client so the configured
-                    # timeout takes effect on the very next fallback request,
-                    # not only after a later credential-rotation rebuild.
-                    self._replace_primary_openai_client(reason="fallback_timeout_apply")
+            # Unified OpenAI-compatible path - all special mode handling removed
+            self.api_key = fb_client.api_key
+            self.client = fb_client
+            # Preserve provider-specific headers that
+            # resolve_provider_client() may have baked into
+            # fb_client via the default_headers kwarg.  The OpenAI
+            # SDK stores these in _custom_headers.  Without this,
+            # subsequent request-client rebuilds (via
+            # _create_request_openai_client) drop the headers,
+            # causing 403s from providers like Kimi Coding that
+            # require a User-Agent sentinel.
+            fb_headers = getattr(fb_client, "_custom_headers", None)
+            if not fb_headers:
+                fb_headers = getattr(fb_client, "default_headers", None)
+            self._client_kwargs = {
+                "api_key": fb_client.api_key,
+                "base_url": fb_base_url,
+                **({"default_headers": dict(fb_headers)} if fb_headers else {}),
+            }
+            if _fb_timeout is not None:
+                self._client_kwargs["timeout"] = _fb_timeout
+                # Rebuild the shared OpenAI client so the configured
+                # timeout takes effect on the very next fallback request,
+                # not only after a later credential-rotation rebuild.
+                self._replace_primary_openai_client(reason="fallback_timeout_apply")
 
-            # Re-evaluate prompt caching for the new provider/model
-            self._use_prompt_caching, self._use_native_cache_layout = (
-                self._anthropic_prompt_cache_policy(
-                    provider=fb_provider,
-                    base_url=fb_base_url,
-                    api_mode=fb_api_mode,
-                    model=fb_model,
-                )
-            )
-            self._use_long_lived_prefix_cache = bool(
-                self._use_prompt_caching
-                and self._supports_long_lived_anthropic_cache(
-                    provider=fb_provider,
-                    base_url=fb_base_url,
-                    api_mode=fb_api_mode,
-                    model=fb_model,
-                )
-            )
+            # Prompt caching disabled - anthropic-specific feature removed
+            self._use_prompt_caching = False
+            self._use_native_cache_layout = False
+            self._use_long_lived_prefix_cache = False
 
             # LM Studio: preload before probing the fallback's context length.
             self._ensure_lmstudio_runtime_loaded()
