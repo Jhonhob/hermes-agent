@@ -6722,9 +6722,9 @@ class AIAgent:
             return False
 
         try:
-            from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
-
-            new_token = resolve_anthropic_token()
+            # Anthropic credential refresh requires anthropic_adapter which has been removed
+            logger.debug("Anthropic credential refresh not available - adapter removed")
+            return False
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False
@@ -6740,23 +6740,17 @@ class AIAgent:
         except Exception:
             pass
 
-        try:
-            self._anthropic_client = build_anthropic_client(
-                new_token,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-            )
-        except Exception as exc:
-            logger.warning("Failed to rebuild Anthropic client after credential refresh: %s", exc)
-            return False
+        # build_anthropic_client has been removed with anthropic_adapter
+        logger.warning("Anthropic client rebuild not available - adapter removed")
+        return False
 
         self._anthropic_api_key = new_token
         # Update OAuth flag — token type may have changed (API key ↔ OAuth).
         # Only treat as OAuth on native Anthropic; third-party endpoints using
         # the Anthropic protocol must not trip OAuth paths (#1739 & third-party
         # identity-injection guard).
-        from agent.anthropic_adapter import _is_oauth_token
-        self._is_anthropic_oauth = _is_oauth_token(new_token) if self.provider == "anthropic" else False
+        # _is_oauth_token has been removed with anthropic_adapter
+        self._is_anthropic_oauth = False if self.provider == "anthropic" else False
         return True
 
     def _apply_client_headers_for_base_url(self, base_url: str) -> None:
@@ -6916,28 +6910,12 @@ class AIAgent:
     def _rebuild_anthropic_client(self) -> None:
         """Rebuild the Anthropic client after an interrupt or stale call.
 
-        Handles both direct Anthropic and Bedrock-hosted Anthropic models
-        correctly — rebuilding with the Bedrock SDK when provider is bedrock,
-        rather than always falling back to build_anthropic_client() which
-        requires a direct Anthropic API key.
-
-        Honors ``self._oauth_1m_beta_disabled`` (set by the reactive recovery
-        path when an OAuth subscription rejects the 1M-context beta) so the
-        rebuilt client carries the reduced beta set.
+        This method has been deprecated as anthropic_adapter has been removed.
+        The system now uses OpenAI compatible interfaces only.
         """
-        _drop_1m = bool(getattr(self, "_oauth_1m_beta_disabled", False))
-        if getattr(self, "provider", None) == "bedrock":
-            from agent.anthropic_adapter import build_anthropic_bedrock_client
-            region = getattr(self, "_bedrock_region", "us-east-1") or "us-east-1"
-            self._anthropic_client = build_anthropic_bedrock_client(region)
-        else:
-            from agent.anthropic_adapter import build_anthropic_client
-            self._anthropic_client = build_anthropic_client(
-                self._anthropic_api_key,
-                getattr(self, "_anthropic_base_url", None),
-                timeout=get_provider_request_timeout(self.provider, self.model),
-                drop_context_1m_beta=_drop_1m,
-            )
+        # anthropic_adapter has been removed - this method is now a no-op
+        logger.debug("_rebuild_anthropic_client called but adapter removed - no-op")
+        pass
 
     def _interruptible_api_call(self, api_kwargs: dict):
         """
@@ -6969,30 +6947,21 @@ class AIAgent:
                         on_first_delta=getattr(self, "_codex_on_first_delta", None),
                     )
                 elif self.api_mode == "anthropic_messages":
-                    result["response"] = self._anthropic_messages_create(api_kwargs)
-                elif self.api_mode == "bedrock_converse":
-                    # Bedrock uses boto3 directly — no OpenAI client needed.
-                    # normalize_converse_response produces an OpenAI-compatible
-                    # SimpleNamespace so the rest of the agent loop can treat
-                    # bedrock responses like chat_completions responses.
-                    from agent.bedrock_adapter import (
-                        _get_bedrock_runtime_client,
-                        invalidate_runtime_client,
-                        is_stale_connection_error,
-                        normalize_converse_response,
+                    # anthropic_messages mode requires anthropic_adapter which has been removed
+                    # Fall through to chat_completions as the unified OpenAI-compatible path
+                    request_client_holder["client"] = self._create_request_openai_client(
+                        reason="chat_completion_request",
+                        api_kwargs=api_kwargs,
                     )
-                    region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-                    api_kwargs.pop("__bedrock_converse__", None)
-                    client = _get_bedrock_runtime_client(region)
-                    try:
-                        raw_response = client.converse(**api_kwargs)
-                    except Exception as _bedrock_exc:
-                        # Evict the cached client on stale-connection failures
-                        # so the outer retry loop builds a fresh client/pool.
-                        if is_stale_connection_error(_bedrock_exc):
-                            invalidate_runtime_client(region)
-                        raise
-                    result["response"] = normalize_converse_response(raw_response)
+                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+                elif self.api_mode == "bedrock_converse":
+                    # bedrock_converse mode requires bedrock_adapter which has been removed
+                    # Fall through to chat_completions as the unified OpenAI-compatible path
+                    request_client_holder["client"] = self._create_request_openai_client(
+                        reason="chat_completion_request",
+                        api_kwargs=api_kwargs,
+                    )
+                    result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
                 else:
                     request_client_holder["client"] = self._create_request_openai_client(
                         reason="chat_completion_request",
@@ -7051,13 +7020,10 @@ class AIAgent:
                     f"Aborting call."
                 )
                 try:
-                    if self.api_mode == "anthropic_messages":
-                        self._anthropic_client.close()
-                        self._rebuild_anthropic_client()
-                    else:
-                        rc = request_client_holder.get("client")
-                        if rc is not None:
-                            self._close_request_openai_client(rc, reason="stale_call_kill")
+                    # anthropic_messages mode removed - use unified OpenAI client path
+                    rc = request_client_holder.get("client")
+                    if rc is not None:
+                        self._close_request_openai_client(rc, reason="stale_call_kill")
                 except Exception:
                     pass
                 self._touch_activity(
@@ -7077,13 +7043,10 @@ class AIAgent:
                 # token generation without poisoning the shared client used to
                 # seed future retries.
                 try:
-                    if self.api_mode == "anthropic_messages":
-                        self._anthropic_client.close()
-                        self._rebuild_anthropic_client()
-                    else:
-                        request_client = request_client_holder.get("client")
-                        if request_client is not None:
-                            self._close_request_openai_client(request_client, reason="interrupt_abort")
+                    # anthropic_messages mode removed - use unified OpenAI client path
+                    request_client = request_client_holder.get("client")
+                    if request_client is not None:
+                        self._close_request_openai_client(request_client, reason="interrupt_abort")
                 except Exception:
                     pass
                 raise InterruptedError("Agent interrupted during API call")
@@ -7289,73 +7252,8 @@ class AIAgent:
             finally:
                 self._codex_on_first_delta = None
 
-        # Bedrock Converse uses boto3's converse_stream() with real-time delta
-        # callbacks — same UX as Anthropic and chat_completions streaming.
-        if self.api_mode == "bedrock_converse":
-            result = {"response": None, "error": None}
-            first_delta_fired = {"done": False}
-            deltas_were_sent = {"yes": False}
-
-            def _fire_first():
-                if not first_delta_fired["done"] and on_first_delta:
-                    first_delta_fired["done"] = True
-                    try:
-                        on_first_delta()
-                    except Exception:
-                        pass
-
-            def _bedrock_call():
-                try:
-                    from agent.bedrock_adapter import (
-                        _get_bedrock_runtime_client,
-                        invalidate_runtime_client,
-                        is_stale_connection_error,
-                        stream_converse_with_callbacks,
-                    )
-                    region = api_kwargs.pop("__bedrock_region__", "us-east-1")
-                    api_kwargs.pop("__bedrock_converse__", None)
-                    client = _get_bedrock_runtime_client(region)
-                    try:
-                        raw_response = client.converse_stream(**api_kwargs)
-                    except Exception as _bedrock_exc:
-                        # Evict the cached client on stale-connection failures
-                        # so the outer retry loop builds a fresh client/pool.
-                        if is_stale_connection_error(_bedrock_exc):
-                            invalidate_runtime_client(region)
-                        raise
-
-                    def _on_text(text):
-                        _fire_first()
-                        self._fire_stream_delta(text)
-                        deltas_were_sent["yes"] = True
-
-                    def _on_tool(name):
-                        _fire_first()
-                        self._fire_tool_gen_started(name)
-
-                    def _on_reasoning(text):
-                        _fire_first()
-                        self._fire_reasoning_delta(text)
-
-                    result["response"] = stream_converse_with_callbacks(
-                        raw_response,
-                        on_text_delta=_on_text if self._has_stream_consumers() else None,
-                        on_tool_start=_on_tool,
-                        on_reasoning_delta=_on_reasoning if self.reasoning_callback or self.stream_delta_callback else None,
-                        on_interrupt_check=lambda: self._interrupt_requested,
-                    )
-                except Exception as e:
-                    result["error"] = e
-
-            t = threading.Thread(target=_bedrock_call, daemon=True)
-            t.start()
-            while t.is_alive():
-                t.join(timeout=0.3)
-                if self._interrupt_requested:
-                    raise InterruptedError("Agent interrupted during Bedrock API call")
-            if result["error"] is not None:
-                raise result["error"]
-            return result["response"]
+        # Bedrock Converse mode removed - fall through to unified chat_completions streaming path
+        # The bedrock_adapter has been removed as part of the OpenAI-compatible interface refactor
 
         result = {"response": None, "error": None, "partial_tool_names": []}
         request_client_holder = {"client": None, "diag": None}
@@ -8287,18 +8185,27 @@ class AIAgent:
             _fb_timeout = get_provider_request_timeout(fb_provider, fb_model)
 
             if fb_api_mode == "anthropic_messages":
-                # Build native Anthropic client instead of using OpenAI client
-                from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
-                effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
-                self.api_key = effective_key
-                self._anthropic_api_key = effective_key
-                self._anthropic_base_url = fb_base_url
-                self._anthropic_client = build_anthropic_client(
-                    effective_key, self._anthropic_base_url, timeout=_fb_timeout,
-                )
-                self._is_anthropic_oauth = _is_oauth_token(effective_key) if fb_provider == "anthropic" else False
-                self.client = None
-                self._client_kwargs = {}
+                # anthropic_messages mode removed - use unified OpenAI-compatible path
+                # The anthropic_adapter has been removed as part of the refactor
+                self.api_key = fb_client.api_key
+                self.client = fb_client
+                self._client_kwargs = {
+                    "api_key": fb_client.api_key,
+                    "base_url": fb_base_url,
+                }
+                if _fb_timeout is not None:
+                    self._client_kwargs["timeout"] = _fb_timeout
+            elif fb_api_mode == "bedrock_converse":
+                # bedrock_converse mode removed - use unified OpenAI-compatible path
+                # The bedrock_adapter has been removed as part of the refactor
+                self.api_key = fb_client.api_key
+                self.client = fb_client
+                self._client_kwargs = {
+                    "api_key": fb_client.api_key,
+                    "base_url": fb_base_url,
+                }
+                if _fb_timeout is not None:
+                    self._client_kwargs["timeout"] = _fb_timeout
             else:
                 # Swap OpenAI client and config in-place
                 self.api_key = fb_client.api_key
@@ -8416,38 +8323,27 @@ class AIAgent:
             self._use_prompt_caching = rt["use_prompt_caching"]
             # Default to native layout when the restored snapshot predates the
             # native-vs-proxy split (older sessions saved before this PR).
+            # Note: anthropic_messages mode removed - this now defaults to False
             self._use_native_cache_layout = rt.get(
                 "use_native_cache_layout",
-                self.api_mode == "anthropic_messages" and self.provider == "anthropic",
+                False,
             )
             # Long-lived prefix flag was added later — restore False on
             # snapshots predating the new field, then re-evaluate against
             # the restored provider/model in case the user had it enabled.
+            # Note: _supports_long_lived_anthropic_cache removed with adapter
             self._use_long_lived_prefix_cache = rt.get(
                 "use_long_lived_prefix_cache",
-                bool(
-                    self._use_prompt_caching
-                    and self._supports_long_lived_anthropic_cache()
-                ),
+                False,
             )
 
             # ── Rebuild client for the primary provider ──
-            if self.api_mode == "anthropic_messages":
-                from agent.anthropic_adapter import build_anthropic_client
-                self._anthropic_api_key = rt["anthropic_api_key"]
-                self._anthropic_base_url = rt["anthropic_base_url"]
-                self._anthropic_client = build_anthropic_client(
-                    rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
-                )
-                self._is_anthropic_oauth = rt["is_anthropic_oauth"]
-                self.client = None
-            else:
-                self.client = self._create_openai_client(
-                    dict(rt["client_kwargs"]),
-                    reason="restore_primary",
-                    shared=True,
-                )
+            # anthropic_messages mode removed - always use OpenAI-compatible client
+            self.client = self._create_openai_client(
+                dict(rt["client_kwargs"]),
+                reason="restore_primary",
+                shared=True,
+            )
 
             # ── Restore context engine state ──
             cc = self.context_compressor
@@ -8531,22 +8427,12 @@ class AIAgent:
                 self._transport_cache.clear()
             self.api_key = rt["api_key"]
 
-            if self.api_mode == "anthropic_messages":
-                from agent.anthropic_adapter import build_anthropic_client
-                self._anthropic_api_key = rt["anthropic_api_key"]
-                self._anthropic_base_url = rt["anthropic_base_url"]
-                self._anthropic_client = build_anthropic_client(
-                    rt["anthropic_api_key"], rt["anthropic_base_url"],
-                    timeout=get_provider_request_timeout(self.provider, self.model),
-                )
-                self._is_anthropic_oauth = rt["is_anthropic_oauth"]
-                self.client = None
-            else:
-                self.client = self._create_openai_client(
-                    dict(rt["client_kwargs"]),
-                    reason="primary_recovery",
-                    shared=True,
-                )
+            # anthropic_messages mode removed - always use OpenAI-compatible client
+            self.client = self._create_openai_client(
+                dict(rt["client_kwargs"]),
+                reason="primary_recovery",
+                shared=True,
+            )
 
             wait_time = min(3 + retry_count, 8)
             self._vprint(
@@ -9134,13 +9020,8 @@ class AIAgent:
             _prefs["data_collection"] = self.provider_data_collection
 
         # Claude max-output override on aggregators
+        # Note: _get_anthropic_max_output removed with anthropic_adapter
         _ant_max = None
-        if (_is_or or _is_nous) and "claude" in (self.model or "").lower():
-            try:
-                from agent.anthropic_adapter import _get_anthropic_max_output
-                _ant_max = _get_anthropic_max_output(self.model)
-            except Exception:
-                pass
 
         # Qwen session metadata
         _qwen_meta = None
