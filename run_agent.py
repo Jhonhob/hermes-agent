@@ -12904,16 +12904,9 @@ class AIAgent:
                         and not anthropic_auth_retry_attempted
                     ):
                         anthropic_auth_retry_attempted = True
-                        from agent.anthropic_adapter import _is_oauth_token
-                        if self._try_refresh_anthropic_client_credentials():
-                            print(f"{self.log_prefix}🔐 Anthropic credentials refreshed after 401. Retrying request...")
-                            continue
-                        # Credential refresh didn't help — show diagnostic info
-                        key = self._anthropic_api_key
-                        auth_method = "Bearer (OAuth/setup-token)" if _is_oauth_token(key) else "x-api-key (API key)"
-                        print(f"{self.log_prefix}🔐 Anthropic 401 — authentication failed.")
-                        print(f"{self.log_prefix}   Auth method: {auth_method}")
-                        print(f"{self.log_prefix}   Token prefix: {key[:12]}..." if key and len(key) > 12 else f"{self.log_prefix}   Token: (empty or short)")
+                        # Anthropic credential refresh not available - adapter removed
+                        print(f"{self.log_prefix}🔧 Anthropic 401 — authentication failed.")
+                        print(f"{self.log_prefix}   Note: Anthropic adapter removed in OpenAI-compatible refactor")
                         print(f"{self.log_prefix}   Troubleshooting:")
                         from hermes_constants import display_hermes_home as _dhh_fn
                         _dhh = _dhh_fn()
