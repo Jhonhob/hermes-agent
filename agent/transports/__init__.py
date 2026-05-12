@@ -2,9 +2,11 @@
 
 Usage:
     from agent.transports import get_transport
-    transport = get_transport("anthropic_messages")
+    transport = get_transport("chat_completions")
     result = transport.normalize_response(raw_response)
 """
+
+from typing import Optional, Type, Dict
 
 from agent.transports.types import (
     NormalizedResponse,
@@ -14,8 +16,8 @@ from agent.transports.types import (
     map_finish_reason,
 )  # noqa: F401
 
-_REGISTRY: dict = {}
-_discovered: bool = False
+_REGISTRY: Dict[str, Type] = {}
+_discovered = True
 
 
 def register_transport(api_mode: str, transport_cls: type) -> None:
@@ -23,46 +25,28 @@ def register_transport(api_mode: str, transport_cls: type) -> None:
     _REGISTRY[api_mode] = transport_cls
 
 
-def get_transport(api_mode: str):
+def get_transport(api_mode: str = "chat_completions"):
     """Get a transport instance for the given api_mode.
 
+    Only supports 'chat_completions' (OpenAI-compatible API).
     Returns None if no transport is registered for this api_mode.
-    This allows gradual migration — call sites can check for None
-    and fall back to the legacy code path.
     """
-    global _discovered
-    if not _discovered:
-        _discover_transports()
     cls = _REGISTRY.get(api_mode)
-    if cls is None:
-        # The registry can be partially populated when a specific transport
-        # module was imported directly (for example chat_completions before
-        # codex).  Discover on misses, not only when the registry is empty, so
-        # test/order-dependent imports do not make valid api_modes unavailable.
-        _discover_transports()
-        cls = _REGISTRY.get(api_mode)
     if cls is None:
         return None
     return cls()
 
 
 def _discover_transports() -> None:
-    """Import all transport modules to trigger auto-registration."""
+    """Discover and register all available transports."""
     global _discovered
+    if _discovered:
+        return
+    # Import ChatCompletionsTransport which auto-registers itself
+    # Must import the module, not just the class, to trigger registration
+    import agent.transports.chat_completions  # noqa: F401
     _discovered = True
-    try:
-        import agent.transports.anthropic  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.codex  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.chat_completions  # noqa: F401
-    except ImportError:
-        pass
-    try:
-        import agent.transports.bedrock  # noqa: F401
-    except ImportError:
-        pass
+
+
+# Auto-discover transports on module load
+_discover_transports()

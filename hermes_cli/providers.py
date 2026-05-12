@@ -55,11 +55,6 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         auth_type="oauth_device_code",
         base_url_override="https://inference-api.nousresearch.com/v1",
     ),
-    "openai-codex": HermesOverlay(
-        transport="codex_responses",
-        auth_type="oauth_external",
-        base_url_override="https://chatgpt.com/backend-api/codex",
-    ),
     "qwen-oauth": HermesOverlay(
         transport="openai_chat",
         auth_type="oauth_external",
@@ -78,18 +73,12 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_override="http://127.0.0.1:1234/v1",
         base_url_env_var="LM_BASE_URL",
     ),
-    "copilot-acp": HermesOverlay(
-        transport="codex_responses",
-        auth_type="external_process",
-        base_url_override="acp://copilot",
-        base_url_env_var="COPILOT_ACP_BASE_URL",
-    ),
     "github-copilot": HermesOverlay(
         transport="openai_chat",
         extra_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN"),
     ),
     "anthropic": HermesOverlay(
-        transport="anthropic_messages",
+        transport="openai_chat",
         extra_env_vars=("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"),
     ),
     "zai": HermesOverlay(
@@ -108,16 +97,16 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_env_var="STEPFUN_BASE_URL",
     ),
     "minimax": HermesOverlay(
-        transport="anthropic_messages",
+        transport="openai_chat",
         base_url_env_var="MINIMAX_BASE_URL",
     ),
     "minimax-oauth": HermesOverlay(
-        transport="anthropic_messages",
+        transport="openai_chat",
         auth_type="oauth_external",
         base_url_override="https://api.minimax.io/anthropic",
     ),
     "minimax-cn": HermesOverlay(
-        transport="anthropic_messages",
+        transport="openai_chat",
         base_url_env_var="MINIMAX_CN_BASE_URL",
     ),
     "deepseek": HermesOverlay(
@@ -157,7 +146,7 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         base_url_env_var="HF_BASE_URL",
     ),
     "xai": HermesOverlay(
-        transport="codex_responses",
+        transport="openai_chat",
         base_url_override="https://api.x.ai/v1",
         base_url_env_var="XAI_BASE_URL",
     ),
@@ -189,14 +178,13 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="OLLAMA_BASE_URL",
     ),
-    # Azure Foundry: supports both OpenAI-style and Anthropic-style endpoints.
-    # The transport is determined at runtime from config.yaml model.api_mode.
+    # Azure Foundry: OpenAI-compatible endpoints only.
     "azure-foundry": HermesOverlay(
-        transport="openai_chat",  # default; overridden by api_mode in config
+        transport="openai_chat",
         base_url_env_var="AZURE_FOUNDRY_BASE_URL",
     ),
     "bedrock": HermesOverlay(
-        transport="bedrock_converse",
+        transport="openai_chat",
         auth_type="aws_sdk",
     ),
 }
@@ -368,9 +356,6 @@ _LABEL_OVERRIDES: Dict[str, str] = {
 
 TRANSPORT_TO_API_MODE: Dict[str, str] = {
     "openai_chat": "chat_completions",
-    "anthropic_messages": "anthropic_messages",
-    "codex_responses": "codex_responses",
-    "bedrock_converse": "bedrock_converse",
 }
 
 
@@ -483,42 +468,11 @@ def is_aggregator(provider: str) -> bool:
 def determine_api_mode(provider: str, base_url: str = "") -> str:
     """Determine the API mode (wire protocol) for a provider/endpoint.
 
-    Resolution order:
-      1. Known provider → transport → TRANSPORT_TO_API_MODE.
-      2. URL heuristics for unknown / custom providers.
-      3. Default: 'chat_completions'.
+    All providers now use 'chat_completions' (OpenAI-compatible API).
+    URL heuristics are kept for backwards compatibility but always return
+    'chat_completions'.
     """
-    pdef = get_provider(provider)
-    if pdef is not None:
-        # Even for known providers, check URL heuristics for special endpoints
-        # (e.g. kimi /coding endpoint needs anthropic_messages even on 'custom')
-        if base_url:
-            url_lower = base_url.rstrip("/").lower()
-            if "api.kimi.com/coding" in url_lower:
-                return "anthropic_messages"
-            if url_lower.endswith("/anthropic") or "api.anthropic.com" in url_lower:
-                return "anthropic_messages"
-            if "api.openai.com" in url_lower:
-                return "codex_responses"
-        return TRANSPORT_TO_API_MODE.get(pdef.transport, "chat_completions")
-
-    # Direct provider checks for providers not in HERMES_OVERLAYS
-    if provider == "bedrock":
-        return "bedrock_converse"
-
-    # URL-based heuristics for custom / unknown providers
-    if base_url:
-        url_lower = base_url.rstrip("/").lower()
-        hostname = base_url_hostname(base_url)
-        if url_lower.endswith("/anthropic") or hostname == "api.anthropic.com":
-            return "anthropic_messages"
-        if hostname == "api.kimi.com" and "/coding" in url_lower:
-            return "anthropic_messages"
-        if hostname == "api.openai.com":
-            return "codex_responses"
-        if hostname.startswith("bedrock-runtime.") and base_url_host_matches(base_url, "amazonaws.com"):
-            return "bedrock_converse"
-
+    # All providers use OpenAI-compatible chat completions API
     return "chat_completions"
 
 
