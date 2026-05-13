@@ -2335,7 +2335,6 @@ class AIAgent:
             self._anthropic_prompt_cache_policy(
                 provider=new_provider,
                 base_url=self.base_url,
-                api_mode=api_mode,
                 model=new_model,
             )
         )
@@ -2344,7 +2343,6 @@ class AIAgent:
             and self._supports_long_lived_anthropic_cache(
                 provider=new_provider,
                 base_url=self.base_url,
-                api_mode=api_mode,
                 model=new_model,
             )
         )
@@ -3142,8 +3140,7 @@ class AIAgent:
     ) -> bool:
         """Decide whether the long-lived (1h cross-session) cache layout applies.
 
-        Narrower than ``_anthropic_prompt_cache_policy`` — only enabled
-        for Claude and Qwen models on validated endpoints:
+        Only enabled for Claude and Qwen models on validated endpoints:
 
           * OpenRouter (``base_url`` contains ``openrouter.ai``)
           * Nous Portal (``base_url`` contains ``nousresearch`` — proxies
@@ -3161,11 +3158,6 @@ class AIAgent:
         is_claude = "claude" in model_lower
         is_nous_portal = "nousresearch" in eff_base_url.lower()
 
-        # Nous Portal: Claude AND Qwen both get long-lived caching.
-        # Portal proxies to OpenRouter with identical cache_control
-        # semantics; any model on Portal that accepts envelope-layout
-        # markers via _anthropic_prompt_cache_policy also benefits from
-        # the documented 1h cross-session TTL.
         if is_nous_portal and (is_claude or "qwen" in model_lower):
             return True
 
